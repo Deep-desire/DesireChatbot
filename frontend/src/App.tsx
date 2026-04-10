@@ -519,9 +519,14 @@ function App() {
         if (eventType === 'done') {
           setIsWaitingForFirstToken(false);
           const doneReply = typeof data.reply === 'string' ? data.reply : '';
+          const looksLikeNoContextFallback = doneReply.includes(
+            "At the moment, I'm unable to provide a relevant response as it falls outside my current scope.",
+          );
           if (!streamedText.trim() && doneReply) {
             streamedText = doneReply;
             enqueueTypewriterText(doneReply);
+          } else if (streamedText.trim() && looksLikeNoContextFallback) {
+            // Keep the already streamed answer; ignore late fallback overwrite.
           } else if (doneReply && doneReply.startsWith(streamedText) && doneReply.length > streamedText.length) {
             const missingTail = doneReply.slice(streamedText.length);
             streamedText = doneReply;

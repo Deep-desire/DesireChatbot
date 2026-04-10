@@ -282,7 +282,13 @@ def _finalize_trace(status: str, **summary: Any) -> None:
     trace["duration_ms"] = round((time() - float(trace.get("started_at_epoch", time()))) * 1000, 2)
     trace["summary"] = {key: _sanitize_trace_value(value) for key, value in summary.items()}
     trace.pop("started_at_epoch", None)
-    _persist_trace(trace)
+
+    # Trace persistence must never break API responses in production.
+    try:
+        _persist_trace(trace)
+    except Exception as error:
+        logger.warning("Failed to persist chat trace %s: %s", trace.get("trace_id"), error)
+
     if _is_chat_trace_console_enabled():
         logger.info(
             "chat trace %s status=%s endpoint=%s duration_ms=%s",
@@ -1995,6 +2001,7 @@ async def text_chat_stream(
         answer_parts: list[str] = []
         citations: list[dict[str, Any]] = []
         response_citations: list[dict[str, Any]] = []
+        final_done_sent = False
 
         try:
             retrieved_context, top_score, citations = _retrieve_context_and_score(normalized_query)
@@ -2025,6 +2032,12 @@ async def text_chat_stream(
             _save_conversation_turn(effective_session_id, normalized_query, final_answer)
             await _sync_sharepoint_lead_safely(effective_session_id)
 
+            try:
+                suggestions = _build_dynamic_followup_questions(effective_session_id, 3)
+            except Exception as suggestion_error:
+                logger.warning("Failed to build dynamic follow-up questions: %s", suggestion_error)
+                suggestions = []
+
             yield _sse_event(
                 "done",
                 {
@@ -2036,15 +2049,20 @@ async def text_chat_stream(
                         "name": current_lead_name,
                     },
                     "citations": response_citations,
-                    "suggestions": _build_dynamic_followup_questions(effective_session_id, 3),
+                    "suggestions": suggestions,
                 },
             )
+            final_done_sent = True
+
             _trace_step("response.ready", status_code=200, answer_chars=len(final_answer), stream=True)
             if _is_chat_trace_include_context():
                 _finalize_trace("success", status_code=200, reply=final_answer, stream=True)
             else:
                 _finalize_trace("success", status_code=200, answer_chars=len(final_answer), stream=True)
         except RetrievalUnavailableError as error:
+            if final_done_sent:
+                logger.warning("RetrievalUnavailableError after final response sent: %s", error)
+                return
             logger.warning("Text chat streaming retrieval unavailable: %s", error)
             yield _sse_event(
                 "error",
@@ -2057,9 +2075,24 @@ async def text_chat_stream(
             _trace_step("response.error", status_code=503, error=str(error), stream=True)
             _finalize_trace("retrieval_unavailable", status_code=503, error=str(error), stream=True)
         except Exception as error:
+            if final_done_sent:
+                logger.exception("Post-response streaming failure ignored after final payload sent")
+                _trace_step("response.post_send_error", error=str(error), stream=True)
+                trace_state = _get_active_trace()
+                if trace_state and not trace_state.get("status"):
+                    _finalize_trace("success_with_post_send_error", status_code=200, error=str(error), stream=True)
+                return
+
             logger.exception("Text chat streaming pipeline failed")
             runtime_issue = _build_runtime_issue_message(error)
             fallback_answer = _no_context_response()
+
+            try:
+                suggestions = _build_dynamic_followup_questions(effective_session_id, 3)
+            except Exception as suggestion_error:
+                logger.warning("Failed to build fallback follow-up questions: %s", suggestion_error)
+                suggestions = []
+
             yield _sse_event(
                 "done",
                 {
@@ -2071,7 +2104,7 @@ async def text_chat_stream(
                         "name": current_lead_name,
                     },
                     "citations": [],
-                    "suggestions": _build_dynamic_followup_questions(effective_session_id, 3),
+                    "suggestions": suggestions,
                 },
             )
             _trace_step("response.error", status_code=500, error=str(error), stream=True)
@@ -2083,7 +2116,10 @@ async def text_chat_stream(
         finally:
             trace_state = _get_active_trace()
             if trace_state and not trace_state.get("status"):
-                _finalize_trace("cancelled", status_code=499, stream=True)
+                try:
+                    _finalize_trace("cancelled", status_code=499, stream=True)
+                except Exception as finalize_error:
+                    logger.warning("Failed to finalize cancelled trace: %s", finalize_error)
             _deactivate_trace(trace_token)
 
     return StreamingResponse(
